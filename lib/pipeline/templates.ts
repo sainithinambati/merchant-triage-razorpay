@@ -5,6 +5,11 @@ import type { Decision, FactSheet } from "../types";
 const hinglish = (lang: string) => lang === "hinglish";
 
 export function templateReply(decision: Decision, sheet: FactSheet): string {
+  const body = baseTemplate(decision, sheet);
+  return sheet.facts.security_reminder ? `${body} ${sheet.facts.security_reminder}` : body;
+}
+
+function baseTemplate(decision: Decision, sheet: FactSheet): string {
   const hi = hinglish(sheet.language);
   const name = sheet.facts.business_name ? ` ${sheet.facts.business_name} team` : "";
 

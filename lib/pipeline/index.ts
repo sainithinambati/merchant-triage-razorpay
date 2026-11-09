@@ -56,8 +56,8 @@ async function run(ticket: Ticket) {
   await logEvent(ticket.id, "extract_ids", "ok", { ...extracted });
 
   // 2. Sanitize.
-  const { masked, truncated, empty } = sanitize(`${ticket.subject ? `Subject: ${ticket.subject}\n` : ""}${ticket.body}`);
-  await logEvent(ticket.id, "sanitize", empty ? "empty" : "ok", { truncated });
+  const { masked, truncated, empty, sensitive } = sanitize(`${ticket.subject ? `Subject: ${ticket.subject}\n` : ""}${ticket.body}`);
+  await logEvent(ticket.id, "sanitize", empty ? "empty" : "ok", { truncated, sensitive });
   if (empty) {
     return finish(ticket, { queue: "human", reason: "Empty ticket", extracted });
   }
@@ -98,7 +98,7 @@ async function run(ticket: Ticket) {
   await logEvent(ticket.id, "merchant_lookup", ownership, { merchant_id: merchant?.merchant_id ?? claimedId });
 
   // 6. Decision engine (code).
-  const decision = decide({ classification, merchant, ownership, extracted, today });
+  const decision = decide({ classification, merchant, ownership, extracted, today, sensitive, truncated });
   await logEvent(ticket.id, "decision", decision.action, { ...decision });
 
   // 7. KB snapshot: read-only. The exact guidance text used is saved in the ticket's fact sheet.

@@ -14,7 +14,7 @@ const merchant = (o: Partial<Merchant> = {}): Merchant => ({
   gst_invoice_available: "Yes", ...o,
 });
 const cls = (o: Partial<Classification> = {}): Classification => ({
-  intent: "settlement_status", secondary_intents: [], language: "english", sensitive_flags: [],
+  requester_type: "merchant", intent: "settlement_status", secondary_intents: [], language: "english", sensitive_flags: [],
   asks_waiver_or_pricing: false, change_target: "none", confidence: 0.95, summary: "", ...o,
 });
 const ex = (o: Partial<Extracted> = {}): Extracted => ({ merchant_ids: ["M1001"], payment_ids: [], order_ids: [], refund_ids: [], amounts_rupees: [], ...o });
@@ -46,9 +46,10 @@ test("ownership: found (unverified), missing, not found, ambiguous", () => {
   assert.equal(resolveOwnership({ extracted: ex({ merchant_ids: ["M1001", "M1002"] }), merchantById: null }).ownership, "ambiguous");
 });
 
-test("GST invoice 'No' (Excel value) goes to drafts", () => {
+test("GST invoice 'No' (Excel value) goes to drafts with KB-20", () => {
   const d = decide({ classification: cls({ intent: "fees_invoice" }), merchant: merchant({ gst_invoice_available: "No" }), ownership: "unverified", extracted: ex(), today: TODAY });
   assert.equal(d.queue, "drafts");
+  assert.ok(d.kb_ids.includes("KB-20"));
 });
 
 test("KB-15 overrides a missing merchant ID", () => {
@@ -74,7 +75,7 @@ test("Enterprise never auto-sends", () => {
   assert.equal(d.queue, "drafts");
 });
 
-test("delayed: shares future date, escalates a passed date", () => {
+test("delayed: shares future date, escalates a passed date (KB-18)", () => {
   const m = merchant({ settlement_status: "Delayed", hold_reason: "Bank-side delay", expected_settlement_date: "2026-10-02" });
   const ok = decide({ classification: cls(), merchant: m, ownership: "unverified", extracted: ex(), today: TODAY });
   assert.equal(ok.facts.expected_settlement_date, "2 Oct 2026");
@@ -82,6 +83,7 @@ test("delayed: shares future date, escalates a passed date", () => {
   const late = decide({ classification: cls(), merchant: m, ownership: "unverified", extracted: ex(), today: "2026-11-09" });
   assert.equal(late.queue, "drafts");
   assert.equal(late.facts.expected_settlement_date, undefined);
+  assert.ok(late.kb_ids.includes("KB-18") && !late.kb_ids.includes("KB-02"));
 });
 
 test("risk hold escalates to Risk Ops and hides the reason", () => {
@@ -156,4 +158,90 @@ test("ask-info template passes its own output check", async () => {
   const sh: FactSheet = { facts: d.facts, guidance: [], must_not: [], ask_for: d.ask_for, language: "english" };
   assert.deepEqual(checkOutput(templateReply(d, sh), sh).blocking, []);
   assert.deepEqual(checkOutput(templateReply(d, { ...sh, language: "hinglish" }), sh).blocking, []);
+});
+
+// ---------- Round 1 KB edge cases ----------
+const base = { ownership: "unverified" as const, extracted: ex(), today: TODAY };
+
+test("KB-19: settlement amount query escalates with system facts only", () => {
+  const d = decide({ ...base, classification: cls({ intent: "settlement_amount_query" }), merchant: merchant() });
+  assert.equal(d.queue, "drafts");
+  assert.equal(d.team, "Account Manager");
+  assert.equal(d.facts.last_settlement_amount, "Rs. 4,30,000");
+});
+
+test("KB-21: Enterprise adds the Account Manager and never goes to Ready to send", () => {
+  const d = decide({ ...base, classification: cls(), merchant: merchant({ segment: "Enterprise" }) });
+  assert.ok(d.kb_ids.includes("KB-21"));
+  assert.equal(d.queue, "drafts");
+  assert.match(d.team ?? "", /Account Manager/);
+});
+
+test("KB-22: a customer gets general guidance and no merchant facts", () => {
+  const d = decide({ ...base, ownership: "missing", extracted: ex({ merchant_ids: [] }), classification: cls({ requester_type: "customer", intent: "payment_failure" }), merchant: null });
+  assert.deepEqual(d.kb_ids.slice(0, 2), ["KB-22", "KB-06"]);
+  assert.equal(d.queue, "auto");
+  assert.equal(Object.keys(d.facts).length, 0);
+  const big = decide({ ...base, ownership: "missing", extracted: ex({ merchant_ids: [], amounts_rupees: [150000] }), classification: cls({ requester_type: "customer", intent: "refund" }), merchant: null });
+  assert.equal(big.team, "Refund Ops");
+});
+
+test("KB-23: pasted OTP adds the security reminder; PAN alone does not", () => {
+  const d = decide({ ...base, classification: cls(), merchant: merchant(), sensitive: ["secret_code"] });
+  assert.ok(d.kb_ids.includes("KB-23"));
+  assert.ok(d.facts.security_reminder);
+  const pan = decide({ ...base, classification: cls(), merchant: merchant(), sensitive: ["pan"] });
+  assert.ok(!pan.kb_ids.includes("KB-23"));
+});
+
+test("KB-23 reminder also appears in template replies, and passes the output check", async () => {
+  const { templateReply } = await import("../lib/pipeline/templates");
+  const d = decide({ ...base, ownership: "missing", extracted: ex({ merchant_ids: [] }), classification: cls(), merchant: null, sensitive: ["card_number"] });
+  const sh: FactSheet = { facts: d.facts, guidance: [], must_not: [], ask_for: d.ask_for, language: "english" };
+  const text = templateReply(d, sh);
+  assert.match(text, /never ask for them/);
+  assert.deepEqual(checkOutput(text, sh).blocking, []);
+});
+
+test("KB-24: KYC replies point to Dashboard upload", () => {
+  const d = decide({ ...base, classification: cls({ intent: "kyc" }), merchant: merchant() });
+  assert.ok(d.kb_ids.includes("KB-24"));
+});
+
+test("KB-25: other language goes to drafts", () => {
+  const d = decide({ ...base, classification: cls({ language: "other" }), merchant: merchant() });
+  assert.ok(d.kb_ids.includes("KB-25"));
+  assert.equal(d.queue, "drafts");
+});
+
+test("KB-26: KYC hold older than 5 business days goes to an agent", () => {
+  const m = merchant({ settlement_status: "On hold", hold_reason: "KYC pending", hold_since: "2026-09-28", kyc_status: "Pending" });
+  assert.equal(decide({ ...base, classification: cls(), merchant: m }).queue, "auto");
+  const later = decide({ ...base, today: "2026-10-12", classification: cls(), merchant: m });
+  assert.equal(later.queue, "drafts");
+  assert.ok(later.kb_ids.includes("KB-26"));
+  const askedAboutKyc = decide({ ...base, today: "2026-10-12", classification: cls({ intent: "kyc" }), merchant: m });
+  assert.equal(askedAboutKyc.queue, "drafts");
+  assert.ok(askedAboutKyc.kb_ids.includes("KB-26"));
+});
+
+test("settlement question with KYC re-verification adds KB-10", () => {
+  const d = decide({ ...base, classification: cls(), merchant: merchant({ kyc_status: "Re-verification needed" }) });
+  assert.ok(d.kb_ids.includes("KB-10"));
+  assert.equal(d.facts.kyc_status, "Re-verification needed");
+});
+
+test("login problems go to a human (no rule yet)", () => {
+  const d = decide({ ...base, classification: cls({ intent: "account_access" }), merchant: merchant() });
+  assert.equal(d.queue, "human");
+});
+
+test("long ticket is never Ready to send", () => {
+  const d = decide({ ...base, classification: cls(), merchant: merchant(), truncated: true });
+  assert.equal(d.queue, "drafts");
+});
+
+test("sanitize masks OTPs but not the word password on its own", () => {
+  assert.deepEqual(sanitize("my otp is 482913").sensitive, ["secret_code"]);
+  assert.deepEqual(sanitize("forgot password please help").sensitive, []);
 });

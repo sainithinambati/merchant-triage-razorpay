@@ -2,9 +2,14 @@
 // it only rephrases the facts this function selects.
 import { addBusinessDays, fmtDate, fmtRupees } from "../dates";
 import type { Classification, Decision, Extracted, Intent, Merchant } from "../types";
+import type { SensitiveKind } from "./extract";
 
 export const REFUND_ESCALATION_RUPEES = 1_00_000; // KB-07
 export const SUCCESS_RATE_FLOOR_PCT = 85;          // KB-06, strict "below"
+export const KYC_STUCK_BUSINESS_DAYS = 5;          // KB-26 (provisional, needs confirmation)
+
+export const SECURITY_REMINDER =
+  "Please do not share OTPs, passwords, PINs, card numbers, Aadhaar or bank account numbers over email or chat. Our team will never ask for them.";
 
 /** Intents that can be answered without looking at one merchant's records. */
 const GENERIC_INTENTS: Intent[] = ["api_error", "webhook", "api_keys"];
@@ -40,13 +45,46 @@ const base = (over: Partial<Decision>): Decision => ({
   ...over,
 });
 
-export function decide(args: {
+interface DecideArgs {
   classification: Classification;
   merchant: Merchant | null;
   ownership: Ownership;
   extracted: Extracted;
   today: string;
-}): Decision {
+  sensitive?: SensitiveKind[]; // secret data the sender pasted into the ticket
+  truncated?: boolean;         // ticket longer than we read
+}
+
+/** Rules that apply on top of whatever the main rule decided. */
+export function decide(args: DecideArgs): Decision {
+  const d = decideCore(args);
+  const notes: string[] = [];
+
+  // KB-23: the sender pasted an OTP, password, card, Aadhaar or account number.
+  const secrets = (args.sensitive ?? []).filter((k) => k !== "pan");
+  if (secrets.length) {
+    d.kb_ids = [...new Set([...d.kb_ids, "KB-23"])];
+    d.facts = { ...d.facts, security_reminder: SECURITY_REMINDER };
+    d.must_not = [...new Set([...d.must_not, "repeat any OTP, password, PIN, card, Aadhaar or account number"])];
+    notes.push(`sender shared ${secrets.join(", ")} (KB-23)`);
+  }
+  // KB-25: language other than English or Hinglish.
+  if (args.classification.language === "other") {
+    d.kb_ids = [...new Set([...d.kb_ids, "KB-25"])];
+    notes.push("language not English or Hinglish (KB-25)");
+    if (d.queue === "auto") d.queue = "drafts";
+  }
+  // Long ticket: we only read the first part, so a person checks the rest.
+  if (args.truncated) {
+    notes.push("message too long, only the first part was read");
+    if (d.queue === "auto") d.queue = "drafts";
+  }
+  if (d.queue !== "auto") d.auto_allowed = false;
+  if (notes.length) d.reason += ` | ${notes.join("; ")}`;
+  return d;
+}
+
+function decideCore(args: DecideArgs): Decision {
   const { classification: c, merchant: m, ownership, extracted, today } = args;
 
   // 1. KB-15 overrides everything, including a missing merchant ID.
@@ -80,6 +118,19 @@ export function decide(args: {
     });
   }
 
+  // 3b. Login, password and OTP problems: no KB rule yet, so a person handles them.
+  if (c.intent === "account_access") {
+    return base({
+      action: "human", queue: "human", risk: "medium", use_template: true,
+      reason: "Login or account access issue: no KB rule yet (pending your decision)",
+    });
+  }
+
+  // 3c. KB-22: the writer is a customer of a merchant, not the merchant.
+  if (c.requester_type === "customer") {
+    return customerRule(c, extracted);
+  }
+
   // 4. Generic technical questions do not need merchant records.
   if (GENERIC_INTENTS.includes(c.intent) && c.secondary_intents.length === 0) {
     const kb = { api_error: "KB-12", webhook: "KB-13", api_keys: "KB-14" }[c.intent as "api_error" | "webhook" | "api_keys"];
@@ -103,6 +154,15 @@ export function decide(args: {
     parts.push(ruleFor(intent, merchant, c, extracted, today));
   }
 
+  // A settlement question from a merchant whose KYC needs re-verification: point them to KB-10 too.
+  if ((c.intent === "settlement_status" || c.secondary_intents.includes("settlement_status")) && merchant.kyc_status === "Re-verification needed") {
+    parts.push(base({
+      kb_ids: ["KB-10", "KB-24"], queue: "auto", auto_allowed: true,
+      facts: { kyc_status: "Re-verification needed" },
+      reason: "KYC re-verification pending (KB-10)",
+    }));
+  }
+
   // Merge: the most cautious part wins.
   const rank = { auto: 0, info: 1, drafts: 2, specialist: 3, human: 3, security: 4 } as const;
   const worst = parts.reduce((a, b) => (rank[b.queue] > rank[a.queue] ? b : a));
@@ -123,7 +183,12 @@ export function decide(args: {
   // Guards that apply to every reply.
   const blockers: string[] = [];
   if (c.secondary_intents.length > 0) blockers.push("multi-intent");
-  if (merchant.segment === "Enterprise") blockers.push("Enterprise merchant (pending KB decision)");
+  if (merchant.segment === "Enterprise") {
+    // KB-21: an agent reviews every Enterprise reply and the Account Manager is kept informed.
+    merged.kb_ids = [...new Set([...merged.kb_ids, "KB-21"])];
+    merged.team = [merged.team, "Account Manager (FYI)"].filter(Boolean).join(", ");
+    blockers.push("Enterprise merchant (KB-21)");
+  }
   if (blockers.length && merged.queue === "auto") {
     merged.queue = "drafts";
     merged.auto_allowed = false;
@@ -137,6 +202,21 @@ function ruleFor(intent: Intent, m: Merchant, c: Classification, ex: Extracted, 
   switch (intent) {
     case "settlement_status":
       return settlementRule(m, today);
+
+    case "settlement_amount_query":
+      return base({
+        action: "escalate", kb_ids: ["KB-19"], queue: "drafts", team: "Account Manager", risk: "medium",
+        facts: {
+          last_settlement_date: fmtDate(m.last_settlement_date),
+          last_settlement_amount: fmtRupees(m.last_settlement_amount_inr),
+          escalated_to: "your Account Manager for reconciliation",
+        },
+        must_not: ["explain deductions, fees, refunds or adjustments that are not in the facts", "say the amount is correct or wrong"],
+        reason: "KB-19 settlement amount query",
+      });
+
+    case "account_access":
+      return base({ action: "human", queue: "human", reason: "Login or account access issue: no KB rule yet (pending your decision)" });
 
     case "payment_failure": {
       const rate = m.payment_success_rate_7d_pct;
@@ -190,19 +270,23 @@ function ruleFor(intent: Intent, m: Merchant, c: Classification, ex: Extracted, 
       }
       if (m.gst_invoice_available === "No") {
         return base({
-          kb_ids: ["KB-09"], queue: "drafts", facts: { gst_invoice_available: "No" },
-          reason: "KB-09: GST invoice not available (no KB rule for this case yet)",
+          action: "escalate", kb_ids: ["KB-09", "KB-20"], queue: "drafts", team: "Account Manager", risk: "low",
+          facts: { gst_invoice_available: "No" },
+          must_not: ["promise a date for the missing invoice"],
+          reason: "KB-20 GST invoice not available",
         });
       }
       return base({ kb_ids: ["KB-09"], queue: "auto", auto_allowed: true, facts: { gst_invoice_available: "Yes" }, reason: "KB-09 invoice location" });
 
     case "kyc": {
       const facts = { kyc_status: m.kyc_status ?? "unknown" };
-      const kb = m.kyc_status === "Pending" ? ["KB-04", "KB-10"] : ["KB-10"];
+      const stuck = isKycStuck(m, today);
+      const kb = m.kyc_status === "Pending" ? ["KB-04", "KB-10", "KB-24"] : ["KB-10", "KB-24"];
       return base({
-        kb_ids: kb, queue: "auto", auto_allowed: true, facts,
-        must_not: ["ask for documents by email or reply", "share links other than the Dashboard"],
-        reason: `KB-10 KYC (${m.kyc_status})`,
+        kb_ids: stuck ? [...kb, "KB-26"] : kb, queue: stuck ? "drafts" : "auto", auto_allowed: !stuck,
+        team: stuck ? "KYC team" : null, facts,
+        must_not: ["ask for documents by email or reply", "share links other than the Dashboard", "promise a release date"],
+        reason: stuck ? `KB-26 KYC hold pending more than ${KYC_STUCK_BUSINESS_DAYS} business days` : `KB-10 KYC (${m.kyc_status})`,
       });
     }
 
@@ -259,11 +343,13 @@ function settlementRule(m: Merchant, today: string): Decision {
         reason: "KB-02 bank-side delay, date shown in system",
       });
     }
+    // KB-18: the expected date has passed (or is missing). Never quote an old or new date.
     return base({
-      action: "escalate", kb_ids: ["KB-02"], queue: "drafts", team: "Settlements Ops", risk: "medium", facts,
+      action: "escalate", kb_ids: ["KB-18"], queue: "drafts", team: "Settlements team", risk: "medium",
+      facts: { settlement_status: "Delayed", escalated_to: "the settlements team for priority review" },
       must_not: ["quote any settlement date", "say the settlement will arrive soon"],
       forbidden_terms: ["by tomorrow", "today itself", "shortly"],
-      reason: exp ? `KB-02 SLA breached: expected ${fmtDate(exp)} has passed` : "KB-02 delayed with no expected date",
+      reason: exp ? `KB-18 delay past expected date (${fmtDate(exp)})` : "KB-18 delayed with no expected date",
     });
   }
 
@@ -281,12 +367,16 @@ function settlementRule(m: Merchant, today: string): Decision {
         reason: `KB-03 ${m.hold_reason} hold${overdue ? " (past 5 business days)" : ""}`,
       });
     }
-    case "KYC pending":
+    case "KYC pending": {
+      // KB-26 (provisional): a KYC hold older than 5 business days may be stuck, so an agent checks first.
+      const stuck = isKycStuck(m, today);
       return base({
-        kb_ids: ["KB-04", "KB-10"], queue: "auto", auto_allowed: true,
+        kb_ids: stuck ? ["KB-04", "KB-10", "KB-24", "KB-26"] : ["KB-04", "KB-10", "KB-24"],
+        queue: stuck ? "drafts" : "auto", auto_allowed: !stuck, team: stuck ? "KYC team" : null,
         facts: { ...facts, hold_reason: "KYC pending", kyc_status: m.kyc_status ?? "Pending" },
-        reason: "KB-04 KYC hold",
+        reason: stuck ? `KB-26 KYC hold pending more than ${KYC_STUCK_BUSINESS_DAYS} business days` : "KB-04 KYC hold",
       });
+    }
     case "Bank account mismatch":
       return base({
         kb_ids: ["KB-05"], queue: "auto", auto_allowed: true,
@@ -296,4 +386,30 @@ function settlementRule(m: Merchant, today: string): Decision {
     default:
       return base({ action: "human", queue: "human", facts, reason: "On hold with unknown reason" });
   }
+}
+
+/** KB-22: requests from a merchant's customer. General guidance only, never merchant data. */
+function customerRule(c: Classification, ex: Extracted): Decision {
+  const common = {
+    must_not: ["share any merchant account, settlement or business details", "confirm or deny any specific payment"],
+  };
+  if (c.intent === "payment_failure") {
+    return base({ ...common, kb_ids: ["KB-22", "KB-06", "KB-16"], queue: "auto", auto_allowed: true, reason: "KB-22 customer: failed payment guidance" });
+  }
+  if (c.intent === "refund") {
+    if (ex.amounts_rupees.some((a) => a >= REFUND_ESCALATION_RUPEES)) {
+      return base({
+        ...common, action: "escalate", kb_ids: ["KB-22", "KB-07", "KB-16"], queue: "drafts", team: "Refund Ops", risk: "medium",
+        forbidden_terms: ["5-7", "business days", "within"],
+        reason: "KB-22 customer refund of Rs. 1,00,000 or more (KB-07)",
+      });
+    }
+    return base({ ...common, kb_ids: ["KB-22", "KB-07", "KB-16"], queue: "auto", auto_allowed: true, reason: "KB-22 customer: refund guidance" });
+  }
+  return base({ ...common, kb_ids: ["KB-22", "KB-16"], queue: "drafts", risk: "medium", reason: `KB-22 customer request (${c.intent})` });
+}
+
+/** KB-26: a KYC hold older than KYC_STUCK_BUSINESS_DAYS business days. */
+function isKycStuck(m: Merchant, today: string): boolean {
+  return m.hold_reason === "KYC pending" && !!m.hold_since && addBusinessDays(m.hold_since, KYC_STUCK_BUSINESS_DAYS) < today;
 }

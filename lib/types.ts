@@ -74,8 +74,8 @@ export interface Extracted {
 }
 
 export const INTENTS = [
-  "settlement_status", "payment_failure", "refund", "chargeback", "fees_invoice",
-  "kyc", "account_change", "api_error", "webhook", "api_keys", "account_closure",
+  "settlement_status", "settlement_amount_query", "payment_failure", "refund", "chargeback", "fees_invoice",
+  "kyc", "account_change", "account_access", "api_error", "webhook", "api_keys", "account_closure",
   "other",
 ] as const;
 export type Intent = (typeof INTENTS)[number];
@@ -87,6 +87,7 @@ export const SENSITIVE_FLAGS = [
 export type SensitiveFlag = (typeof SENSITIVE_FLAGS)[number];
 
 export interface Classification {
+  requester_type: "merchant" | "customer" | "unknown";
   intent: Intent;
   secondary_intents: Intent[];
   language: "english" | "hinglish" | "other";

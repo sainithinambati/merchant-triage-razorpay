@@ -62,6 +62,7 @@ export async function claudeThreatCheck(masked: string): Promise<ThreatResult> {
 
 // ---------------- Classifier ----------------
 const ClassificationSchema = z.object({
+  requester_type: z.enum(["merchant", "customer", "unknown"]),
   intent: z.enum(INTENTS),
   secondary_intents: z.array(z.enum(INTENTS)),
   language: z.enum(["english", "hinglish", "other"]),
@@ -74,14 +75,19 @@ const ClassificationSchema = z.object({
 
 const CLASSIFY_SYSTEM = `You classify merchant support tickets for an Indian payment gateway. Output only the schema.
 
+requester_type: "merchant" if the writer runs the business that uses the payment gateway; "customer" if the writer paid a business
+(a shopper asking about their own payment, refund or order); "unknown" if it is not clear.
+
 intent (main request) and secondary_intents (other distinct requests in the same ticket, excluding the main one):
 - settlement_status: where is my settlement / payout, settlement delayed or on hold
+- settlement_amount_query: the settlement arrived but the amount is lower or different than expected (deductions, adjustments)
 - payment_failure: customer payments failing, money deducted but order failed
 - refund: refund status or refund not received
 - chargeback: customer dispute or chargeback notice
 - fees_invoice: GST invoice, fees, MDR, pricing, waivers
 - kyc: KYC documents, verification, re-verification requests
 - account_change: change email, mobile, bank account, legal name or business type
+- account_access: cannot log in, forgot password, OTP not received, two-factor or locked account
 - api_error: integration errors such as SIGNATURE_MISMATCH, BAD_REQUEST_ERROR
 - webhook: webhooks not received
 - api_keys: authentication failed, test vs live keys

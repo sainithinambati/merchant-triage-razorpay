@@ -24,19 +24,31 @@ export function extractIds(text: string): Extracted {
 
 const MAX_CHARS = 4000;
 
-/** Mask PII before anything is sent to Claude. IDs are kept: they are not personal data. */
-export function sanitize(text: string): { masked: string; truncated: boolean; empty: boolean } {
+export type SensitiveKind = "secret_code" | "card_number" | "aadhaar" | "bank_account" | "pan";
+
+/**
+ * Mask PII before anything is sent to Claude. IDs are kept: they are not personal data.
+ * `sensitive` lists the kinds of secret data the merchant shared, so the reply can warn them (KB-23).
+ */
+export function sanitize(text: string): { masked: string; truncated: boolean; empty: boolean; sensitive: SensitiveKind[] } {
   const trimmed = text.replace(/\u0000/g, "").trim();
   const truncated = trimmed.length > MAX_CHARS;
+  const found = new Set<SensitiveKind>();
   let s = trimmed.slice(0, MAX_CHARS);
+  // OTPs, passwords, PINs, CVVs: mask the value that follows the keyword when it looks like a code.
+  s = s.replace(/\b(otp|one[- ]time password|password|passcode|upi pin|m?pin|cvv)\b(\s*(?:is|:|-|=)?\s*)([^\s,.;]{3,})/gi, (m, k, sep, v) => {
+    if (!/\d/.test(v) && v.length < 8) return m; // "forgot password please" is not a secret
+    found.add("secret_code");
+    return `${k}${sep}[secret]`;
+  });
   s = s.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[email]");
-  s = s.replace(/\b[A-Z]{5}\d{4}[A-Z]\b/g, "[pan]");
-  s = s.replace(/\b\d{4}\s?\d{4}\s?\d{4}\b(?!\s?\d)/g, "[aadhaar-or-card]");
-  s = s.replace(/\b(?:\d[ -]?){13,19}\b/g, "[card]");
+  s = s.replace(/\b[A-Z]{5}\d{4}[A-Z]\b/g, () => (found.add("pan"), "[pan]"));
+  s = s.replace(/\b(?:\d[ -]?){15,18}\d\b/g, () => (found.add("card_number"), "[card]"));
+  s = s.replace(/\b\d{4}\s?\d{4}\s?\d{4}\b(?!\s?\d)/g, () => (found.add("aadhaar"), "[aadhaar]"));
   s = s.replace(/(?:\+91[\s-]?)?\b[6-9]\d{9}\b/g, "[phone]");
-  s = s.replace(/\b\d{9,18}\b/g, "[account-number]");
+  s = s.replace(/\b\d{9,18}\b/g, () => (found.add("bank_account"), "[account-number]"));
   s = s.replace(/\b[A-Z]{4}0[A-Z0-9]{6}\b/g, "[ifsc]");
-  return { masked: s, truncated, empty: trimmed.length === 0 };
+  return { masked: s, truncated, empty: trimmed.length === 0, sensitive: [...found] };
 }
 
 /** Cheap first-pass prompt-injection / abuse patterns. Claude runs a second check. */
